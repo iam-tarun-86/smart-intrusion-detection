@@ -1,0 +1,16 @@
+{
+  "cameras": [
+    {
+      "id": "cam1",
+      "name": "Main Entrance",
+      "source": "pedestrian_test.mp4",
+      "enabled": true
+    },
+    {
+      "id": "cam2",
+      "name": "Side Gate",
+      "source": "pedestrian_test2.mp4",
+      "enabled": true
+    }
+  ]
+}
