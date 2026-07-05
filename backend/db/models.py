@@ -13,6 +13,7 @@ class IntrusionEvent(Base):
     id = Column(Integer, primary_key=True, index=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     zone_name = Column(String(100), nullable=False)
+    camera_id = Column(String(50), nullable=True)
     confidence = Column(Float, nullable=False)
     severity = Column(String(20), default="high")
     snapshot_path = Column(Text, nullable=True)
@@ -27,9 +28,27 @@ class IntrusionEvent(Base):
             "id": self.id,
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
             "zone_name": self.zone_name,
+            "camera_id": self.camera_id,
             "confidence": self.confidence,
             "severity": self.severity,
             "snapshot_path": self.snapshot_path,
             "resolved": self.resolved,
             "bbox": [self.bbox_x1, self.bbox_y1, self.bbox_x2, self.bbox_y2]
+        }
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)  # bcrypt hashed
+    role = Column(String(20), default="guard")  # 'admin' or 'guard'
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "username": self.username,
+            "role": self.role,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }

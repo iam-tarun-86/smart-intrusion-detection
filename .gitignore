@@ -55,3 +55,21 @@ runs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+.mypy_cache/
+
+# Data
+backend/snapshots/
+snapshots/

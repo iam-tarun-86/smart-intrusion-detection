@@ -12,8 +12,11 @@ SQLALCHEMY_DATABASE_URL = "sqlite:///./intrusion.db"
 # Later: "postgresql://user:password@localhost/intrusion_db"
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False} if "sqlite" in SQLALCHEMY_DATABASE_URL else {}
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in SQLALCHEMY_DATABASE_URL else {},
+    pool_size=10,        # Increase from default 5
+    max_overflow=20,     # Increase from default 10
+    pool_timeout=60      # Wait longer before timeout
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

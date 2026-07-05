@@ -18,9 +18,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPExcept
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+import hashlib
+import secrets
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+from datetime import datetime, timedelta
 
 from db.database import engine, get_db
-from db.models import Base, IntrusionEvent
+from db.models import Base, IntrusionEvent, User
 from detection.detector import PersonDetector
 from detection.zones import ZoneManager, Zone
 from stream_manager import StreamManager, CameraConfig, setup_test_cameras
@@ -36,9 +41,55 @@ stream_manager = None
 zone_config_manager = None
 latest_frames: Dict[str, np.ndarray] = {}
 latest_detections: Dict[str, List] = {}
+zone_managers: Dict[str, ZoneManager] = {}
 active_connections: List[WebSocket] = []
 alert_queue = Queue()
 _loop = None
+
+security = HTTPBearer()
+JWT_SECRET = "your-secret-key-change-this-in-production"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 8
+
+def hash_password(password: str) -> str:
+    """Simple secure hash using SHA-256 with salt."""
+    salt = secrets.token_hex(16)
+    hashed = hashlib.sha256((password + salt).encode()).hexdigest()
+    return f"{salt}${hashed}"
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """Verify password against stored hash."""
+    try:
+        salt, stored_hash = hashed.split("$", 1)
+        computed = hashlib.sha256((plain + salt).encode()).hexdigest()
+        return secrets.compare_digest(computed, stored_hash)
+    except ValueError:
+        return False
+
+def create_token(username: str, role: str) -> str:
+    payload = {
+        "sub": username,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    payload = decode_token(credentials.credentials)
+    return {"username": payload["sub"], "role": payload["role"]}
+
+def require_admin(user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
 
 
 def init_system():
@@ -50,6 +101,26 @@ def init_system():
     zone_config_manager = ZoneConfigManager()
 
     print("[System] Multi-stream detection initialized")
+
+    # Seed default users if none exist
+    db = next(get_db())
+    try:
+        if db.query(User).count() == 0:
+            admin = User(
+                username="admin",
+                password_hash=hash_password("admin"),
+                role="admin"
+            )
+            guard = User(
+                username="guard",
+                password_hash=hash_password("guard"),
+                role="guard"
+            )
+            db.add_all([admin, guard])
+            db.commit()
+            print("[System] Default users created: admin/admin, guard/guard")
+    finally:
+        db.close()
 
 
 def process_alert_queue():
@@ -177,10 +248,32 @@ def generate_frames(camera_id: str = "cam1"):
             )
 
     # Load zones for this camera
+        # Load zones for this camera (use defaults if none saved)
     zones = zone_config_manager.load_zones(camera_id)
-    cam_zone_manager = ZoneManager()
-    for zone in zones:
-        cam_zone_manager.add_zone(zone)
+    
+    # If no custom zones, use defaults
+    if not zones:
+        zones = [
+            Zone(
+                name="Server Room",
+                points=[(400, 150), (700, 150), (700, 350), (400, 350)],
+                color=(0, 0, 255),
+                severity="high"
+            ),
+            Zone(
+                name="Storage Area",
+                points=[(50, 100), (250, 100), (250, 300), (50, 300)],
+                color=(255, 165, 0),
+                severity="medium"
+            )
+        ]
+    
+    if camera_id not in zone_managers:
+        zone_managers[camera_id] = ZoneManager()
+        for zone in zones:
+            zone_managers[camera_id].add_zone(zone)
+
+    cam_zone_manager = zone_managers[camera_id]
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 12.0
     width, height = 768, 432
@@ -192,11 +285,23 @@ def generate_frames(camera_id: str = "cam1"):
     print(f"[Stream] Starting stream for {camera_id}")
 
     while True:
+        # Reload zones every 30 seconds to pick up changes
+        if frame_count % (int(fps) * 30) == 0:  # Every 30 seconds
+            new_zones = zone_config_manager.load_zones(camera_id)
+            if new_zones:
+                zone_managers[camera_id] = ZoneManager()
+                for zone in new_zones:
+                    zone_managers[camera_id].add_zone(zone)
+                cam_zone_manager = zone_managers[camera_id]
+                print(f"[Stream] Reloaded {len(new_zones)} zones for {camera_id}")
+
+        frame_count += 1
+
         if not video_ended:
             ret, frame = cap.read()
             if not ret:
-                video_ended = True
-                print(f"[Stream] Video ended for {camera_id}. Holding last frame.")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
             else:
                 last_frame = frame.copy()
 
@@ -230,10 +335,12 @@ def generate_frames(camera_id: str = "cam1"):
             alert_queue.put(event)
 
             # Save to DB
+            db = None
             try:
                 db = next(get_db())
                 db_event = IntrusionEvent(
                     zone_name=event["zone_name"],
+                    camera_id=camera_id,
                     confidence=event["confidence"],
                     severity=event["severity"],
                     snapshot_path=str(snapshot_path),
@@ -248,6 +355,9 @@ def generate_frames(camera_id: str = "cam1"):
                 event["id"] = db_event.id
             except Exception as e:
                 print(f"[DB Error] {e}")
+            finally:
+                if db:
+                    db.close()
 
         latest_frames[camera_id] = annotated
         latest_detections[camera_id] = detections
@@ -255,7 +365,7 @@ def generate_frames(camera_id: str = "cam1"):
         # Overlay info
         person_count = len(detections)
         info = f"Cam: {camera_id} | Persons: {person_count} | Zones: {len(zones)}"
-        cv2.putText(annotated, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(annotated, info, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # Add "VIDEO ENDED" overlay if done
         if video_ended:
@@ -392,6 +502,31 @@ async def get_stats(db: Session = Depends(get_db)):
         "cameras": len(stream_manager.cameras) if stream_manager else 0,
         "streaming": True,
     }
+
+
+@app.post("/auth/login")
+async def login(credentials: dict, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == credentials.get("username")).first()
+    if not user or not verify_password(credentials.get("password", ""), user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    token = create_token(user.username, user.role)
+    return {"token": token, "username": user.username, "role": user.role}
+
+@app.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return user
+
+@app.delete("/alerts/all")
+async def clear_all_alerts(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    """Clear all intrusion events (admin only)."""
+    count = db.query(IntrusionEvent).count()
+    db.query(IntrusionEvent).delete()
+    db.commit()
+    return {"message": f"Cleared {count} events"}
 
 
 if __name__ == "__main__":

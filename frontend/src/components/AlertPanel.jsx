@@ -2,7 +2,6 @@ import { useEffect, useState, useRef } from 'react';
 
 function AlertPanel() {
     const [alerts, setAlerts] = useState([]);
-    const [connected, setConnected] = useState(false);
     const wsRef = useRef(null);
 
     useEffect(() => {
@@ -14,7 +13,6 @@ function AlertPanel() {
         const connect = () => {
             if (!isMounted) return;
 
-            // Clean up old socket
             if (wsRef.current) {
                 wsRef.current.onclose = null;
                 wsRef.current.onerror = null;
@@ -26,9 +24,8 @@ function AlertPanel() {
 
             ws.onopen = () => {
                 if (!isMounted) return;
-                setConnected(true);
-                reconnectDelay = 1000; // Reset backoff on success
-                console.log('[WS] Connected');
+                reconnectDelay = 1000;
+                console.log('[WS] Connected for toasts');
             };
 
             ws.onmessage = (event) => {
@@ -37,7 +34,12 @@ function AlertPanel() {
                 try {
                     const data = JSON.parse(event.data);
                     if (data.type === 'intrusion_alert') {
-                        setAlerts(prev => [data.data, ...prev].slice(0, 20));
+                        const newAlert = { ...data.data, toastId: Date.now() + Math.random() };
+                        setAlerts(prev => [newAlert, ...prev].slice(0, 5));
+                        
+                        setTimeout(() => {
+                            setAlerts(prev => prev.filter(a => a.toastId !== newAlert.toastId));
+                        }, 5000);
                     }
                 } catch (err) {
                     console.error('[WS] Parse error:', event.data);
@@ -46,10 +48,7 @@ function AlertPanel() {
 
             ws.onclose = () => {
                 if (!isMounted) return;
-                setConnected(false);
                 console.log(`[WS] Disconnected, reconnecting in ${reconnectDelay}ms...`);
-
-                // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
                 reconnectTimer = setTimeout(() => {
                     reconnectDelay = Math.min(reconnectDelay * 2, 30000);
                     connect();
@@ -58,10 +57,8 @@ function AlertPanel() {
 
             ws.onerror = (err) => {
                 console.error('[WS] Error:', err);
-                // Don't reconnect here — onclose will handle it
             };
 
-            // Keepalive ping every 25s
             pingInterval = setInterval(() => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send('ping');
@@ -69,7 +66,6 @@ function AlertPanel() {
             }, 25000);
         };
 
-        // Delay first connection by 500ms to let backend settle
         const initialTimer = setTimeout(connect, 500);
 
         return () => {
@@ -84,31 +80,23 @@ function AlertPanel() {
         };
     }, []);
 
+    if (alerts.length === 0) return null;
+
     return (
-        <div className="alert-panel">
-            <h2>Real-Time Alerts</h2>
-            <div className={`connection-status ${connected ? 'connected' : 'disconnected'}`}>
-                {connected ? '🟢 Connected' : '🔴 Disconnected'}
-            </div>
-            <div className="alerts-list">
-                {alerts.length === 0 ? (
-                    <p className="no-alerts">No active intrusions</p>
-                ) : (
-                    alerts.map((alert, idx) => (
-                        <div key={idx} className={`alert-card severity-${alert.severity}`}>
-                            <div className="alert-header">
-                                <span className="alert-icon">🚨</span>
-                                <span className="zone-name">{alert.zone_name}</span>
-                                <span className="severity-badge">{alert.severity}</span>
-                            </div>
-                            <div className="alert-details">
-                                <p>Confidence: {(alert.confidence * 100).toFixed(1)}%</p>
-                                <p>Time: {new Date(alert.timestamp).toLocaleTimeString()}</p>
-                            </div>
-                        </div>
-                    ))
-                )}
-            </div>
+        <div className="toast-container">
+            {alerts.map((alert) => (
+                <div key={alert.toastId} className={`toast severity-${alert.severity}`}>
+                    <div className="alert-header">
+                        <span className="alert-icon">🚨</span>
+                        <span className="zone-name">{alert.zone_name}</span>
+                        <span className="severity-badge">{alert.severity}</span>
+                    </div>
+                    <div className="alert-details">
+                        <p>Camera: {alert.camera_id || 'Unknown'}</p>
+                        <p>Confidence: {(alert.confidence * 100).toFixed(1)}%</p>
+                    </div>
+                </div>
+            ))}
         </div>
     );
 }

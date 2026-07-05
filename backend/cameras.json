@@ -11,6 +11,12 @@
       "name": "Side Gate",
       "source": "pedestrian_test2.mp4",
       "enabled": true
+    },
+    {
+      "id": "webcam",
+      "name": "Live Webcam",
+      "source": "http://192.168.1.6:5000/webcam",
+      "enabled": true
     }
   ]
 }
