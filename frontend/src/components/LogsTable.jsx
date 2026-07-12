@@ -52,6 +52,15 @@ function LogsTable({ compact = false }) {
 
     return (
         <div className={`logs-table ${compact ? 'compact' : 'full'}`}>
+            {/* Clear button at TOP for fullscreen view */}
+            {!compact && isAdmin() && (
+                <div style={{ marginBottom: '1rem', textAlign: 'right' }}>
+                    <button onClick={clearLogs} className="clear-btn">
+                        🗑️ Clear All Logs
+                    </button>
+                </div>
+            )}
+            
             <table>
                 <thead>
                     <tr>
@@ -59,6 +68,7 @@ function LogsTable({ compact = false }) {
                         <th>Time</th>
                         <th>Camera</th>
                         <th>Zone</th>
+                        <th>RISK</th>
                         <th>Severity</th>
                         <th>Confidence</th>
                         <th>Status</th>
@@ -72,6 +82,11 @@ function LogsTable({ compact = false }) {
                             <td>{new Date(log.timestamp).toLocaleString()}</td>
                             <td>{log.camera_id?.toUpperCase() || 'Unknown'}</td>
                             <td>{log.zone_name}</td>
+                            <td>
+                                <span className={`risk-badge risk-${log.risk_score >= 70 ? 'high' : log.risk_score >= 40 ? 'medium' : 'low'}`}>
+                                    {log.risk_score || 0}
+                                </span>
+                            </td>
                             <td>
                                 <span className={`badge severity-${log.severity}`}>{log.severity}</span>
                             </td>
@@ -92,13 +107,6 @@ function LogsTable({ compact = false }) {
             </table>
             {compact && logs.length >= 5 && (
                 <p className="more-hint">⛶ Full Screen for more logs</p>
-            )}
-            {!compact && isAdmin() && (
-                <div style={{ marginTop: '1rem', textAlign: 'right' }}>
-                    <button onClick={clearLogs} className="clear-btn">
-                        🗑️ Clear All Logs
-                    </button>
-                </div>
             )}
         </div>
     );

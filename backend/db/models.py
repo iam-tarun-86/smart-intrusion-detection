@@ -18,6 +18,8 @@ class IntrusionEvent(Base):
     severity = Column(String(20), default="high")
     snapshot_path = Column(Text, nullable=True)
     resolved = Column(Boolean, default=False)
+    risk_score = Column(Integer, default=0)  # NEW
+    duration_seconds = Column(Float, default=0.0)  # NEW
     bbox_x1 = Column(Integer, nullable=True)
     bbox_y1 = Column(Integer, nullable=True)
     bbox_x2 = Column(Integer, nullable=True)
@@ -33,6 +35,8 @@ class IntrusionEvent(Base):
             "severity": self.severity,
             "snapshot_path": self.snapshot_path,
             "resolved": self.resolved,
+            "risk_score": self.risk_score,  # NEW
+            "duration_seconds": self.duration_seconds,  # NEW
             "bbox": [self.bbox_x1, self.bbox_y1, self.bbox_x2, self.bbox_y2]
         }
 

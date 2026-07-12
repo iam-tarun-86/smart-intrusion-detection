@@ -6,7 +6,7 @@ function AlertPanel() {
 
     useEffect(() => {
         let pingInterval;
-        let reconnectDelay = 1000; // Start with 1s, exponential backoff
+        let reconnectDelay = 1000;
         let reconnectTimer = null;
         let isMounted = true;
 
@@ -34,9 +34,13 @@ function AlertPanel() {
                 try {
                     const data = JSON.parse(event.data);
                     if (data.type === 'intrusion_alert') {
-                        const newAlert = { ...data.data, toastId: Date.now() + Math.random() };
+                        const alertData = data.data;
+                        const newAlert = {
+                            ...alertData,
+                            toastId: Date.now() + Math.random()
+                        };
                         setAlerts(prev => [newAlert, ...prev].slice(0, 5));
-                        
+
                         setTimeout(() => {
                             setAlerts(prev => prev.filter(a => a.toastId !== newAlert.toastId));
                         }, 5000);
@@ -93,6 +97,19 @@ function AlertPanel() {
                     </div>
                     <div className="alert-details">
                         <p>Camera: {alert.camera_id || 'Unknown'}</p>
+                        <p>Person ID: #{alert.track_id || '?'}</p>
+                        {alert.risk_score !== undefined && (
+                            <p style={{ 
+                                color: alert.risk_score >= 70 ? '#ef4444' : 
+                                       alert.risk_score >= 40 ? '#f59e0b' : '#10b981',
+                                fontWeight: 'bold'
+                            }}>
+                                🔴 RISK SCORE: {alert.risk_score}/100
+                            </p>
+                        )}
+                        {alert.shirt_color && (
+                            <p>Shirt: {alert.shirt_color.toUpperCase()}</p>
+                        )}
                         <p>Confidence: {(alert.confidence * 100).toFixed(1)}%</p>
                     </div>
                 </div>

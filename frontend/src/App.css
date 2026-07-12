@@ -1524,3 +1524,26 @@ button {
   background: var(--success);
   box-shadow: 0 0 6px var(--success);
 }
+
+.risk-badge {
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 700;
+}
+
+.risk-high {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+}
+
+.risk-medium {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+}
+
+.risk-low {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+}

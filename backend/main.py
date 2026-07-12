@@ -30,6 +30,7 @@ from detection.detector import PersonDetector
 from detection.zones import ZoneManager, Zone
 from stream_manager import StreamManager, CameraConfig, setup_test_cameras
 from zone_config import ZoneConfigManager
+from telegram_notifier import TelegramNotifier
 
 
 # Create tables
@@ -45,6 +46,7 @@ zone_managers: Dict[str, ZoneManager] = {}
 active_connections: List[WebSocket] = []
 alert_queue = Queue()
 _loop = None
+telegram = None
 
 security = HTTPBearer()
 JWT_SECRET = "your-secret-key-change-this-in-production"
@@ -101,6 +103,14 @@ def init_system():
     zone_config_manager = ZoneConfigManager()
 
     print("[System] Multi-stream detection initialized")
+
+    global telegram
+    # Replace with your actual bot token and chat ID
+    telegram = TelegramNotifier(
+        bot_token="8525377163:AAEqzu8HulYOwzPEvqwhJTp9Y1Wu4kZYAnM",
+        chat_id="5037779190"
+    )
+    print("[System] Telegram notifier initialized")
 
     # Seed default users if none exist
     db = next(get_db())
@@ -223,6 +233,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ==================== VIDEO STREAMING ====================
 
+# Camera-specific uniform rules
+CAMERA_UNIFORM_RULES = {
+    "cam1": ["blue"],           # Server Room: blue only
+    "cam2": ["blue", "white"],  # Parking Lot: blue + white allowed
+    "webcam": [],               # Webcam: no enforcement (showcase mode)
+}
+
 
 def generate_frames(camera_id: str = "cam1"):
     """Generator for MJPEG stream. Plays once, then holds last frame."""
@@ -247,31 +264,24 @@ def generate_frames(camera_id: str = "cam1"):
                 b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
             )
 
-    # Load zones for this camera
-        # Load zones for this camera (use defaults if none saved)
+    # Load zones for this camera (empty = camera-wide uniform check)
     zones = zone_config_manager.load_zones(camera_id)
     
-    # If no custom zones, use defaults
-    if not zones:
-        zones = [
-            Zone(
-                name="Server Room",
-                points=[(400, 150), (700, 150), (700, 350), (400, 350)],
-                color=(0, 0, 255),
-                severity="high"
-            ),
-            Zone(
-                name="Storage Area",
-                points=[(50, 100), (250, 100), (250, 300), (50, 300)],
-                color=(255, 165, 0),
-                severity="medium"
-            )
-        ]
-    
     if camera_id not in zone_managers:
-        zone_managers[camera_id] = ZoneManager()
+        allowed_colors = CAMERA_UNIFORM_RULES.get(camera_id, [])
+        enforce_uniform = len(allowed_colors) > 0
+        zone_managers[camera_id] = ZoneManager(
+            camera_name=camera_id,
+            enforce_uniform=enforce_uniform,
+            default_allowed=allowed_colors
+        )
         for zone in zones:
             zone_managers[camera_id].add_zone(zone)
+        
+        if not zones and enforce_uniform:
+            print(f"[ZoneManager] {camera_id}: No zones — camera-wide uniform enforcement (blue only)")
+        elif not zones:
+            print(f"[ZoneManager] {camera_id}: No zones — detection only, no uniform check")
 
     cam_zone_manager = zone_managers[camera_id]
 
@@ -289,7 +299,13 @@ def generate_frames(camera_id: str = "cam1"):
         if frame_count % (int(fps) * 30) == 0:  # Every 30 seconds
             new_zones = zone_config_manager.load_zones(camera_id)
             if new_zones:
-                zone_managers[camera_id] = ZoneManager()
+                allowed_colors = CAMERA_UNIFORM_RULES.get(camera_id, [])
+                enforce_uniform = len(allowed_colors) > 0
+                zone_managers[camera_id] = ZoneManager(
+                    camera_name=camera_id,
+                    enforce_uniform=enforce_uniform,
+                    default_allowed=allowed_colors
+                )
                 for zone in new_zones:
                     zone_managers[camera_id].add_zone(zone)
                 cam_zone_manager = zone_managers[camera_id]
@@ -301,6 +317,9 @@ def generate_frames(camera_id: str = "cam1"):
             ret, frame = cap.read()
             if not ret:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                # Reset alerts when video loops so we can demo again
+                if camera_id in zone_managers:
+                    zone_managers[camera_id].reset_alerts()
                 continue
             else:
                 last_frame = frame.copy()
@@ -322,15 +341,34 @@ def generate_frames(camera_id: str = "cam1"):
 
         # Queue events for async processing
         for event in events:
+            # Ensure track_id and duration_seconds exist on the event dict
+            event["track_id"] = event.get("track_id", 0)
+            event["duration_seconds"] = event.get("duration_seconds", 0)
+            
             snapshot_dir = Path("snapshots") / camera_id
             snapshot_dir.mkdir(parents=True, exist_ok=True)
             snapshot_path = (
                 snapshot_dir
                 / f"event_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
             )
-            cv2.imwrite(str(snapshot_path), annotated)
+            def save_snapshot(path, frame_to_save):
+                cv2.imwrite(str(path), frame_to_save, [cv2.IMWRITE_JPEG_QUALITY, 60])
+
+            Thread(target=save_snapshot, args=(snapshot_path, annotated.copy()), daemon=True).start()
             event["snapshot"] = str(snapshot_path)
             event["camera_id"] = camera_id
+            
+            if telegram and not event.get("authorized", True):
+                alert_msg = (
+                    f"🚨 <b>UNAUTHORIZED ACCESS</b>\n\n"
+                    f"Zone: {event['zone_name']}\n"
+                    f"Camera: {camera_id.upper()}\n"
+                    f"Shirt Color: {event.get('shirt_color', 'unknown').upper()}\n"
+                    f"Person ID: #{event.get('track_id', '?')}\n"
+                    f"Confidence: {event['confidence']*100:.1f}%\n"
+                    f"Time: {event['timestamp']}"
+                )
+                telegram.send_alert(alert_msg, str(snapshot_path))
 
             alert_queue.put(event)
 
@@ -344,6 +382,8 @@ def generate_frames(camera_id: str = "cam1"):
                     confidence=event["confidence"],
                     severity=event["severity"],
                     snapshot_path=str(snapshot_path),
+                    risk_score=event.get("risk_score", 0),  # NEW
+                    duration_seconds=event.get("duration_seconds", 0.0),  # NEW
                     bbox_x1=event["bbox"][0],
                     bbox_y1=event["bbox"][1],
                     bbox_x2=event["bbox"][2],
