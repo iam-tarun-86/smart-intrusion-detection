@@ -9,10 +9,10 @@ from typing import Optional
 
 
 class TelegramNotifier:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+    def __init__(self, bot_token: Optional[str], chat_id: Optional[str]):
+        self.bot_token = bot_token or ""
+        self.chat_id = chat_id or ""
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}" if self.bot_token else ""
         self._recent_alerts = set()  # Prevent spam
     
     def _send_async(self, message: str, photo_path: Optional[str] = None):
@@ -47,6 +47,10 @@ class TelegramNotifier:
 
     def send_alert(self, message: str, photo_path: Optional[str] = None) -> bool:
         """Queue alert to send in background — doesn't block camera."""
+        if not self.bot_token:
+            print("[Telegram] Notifier disabled (missing bot token)")
+            return False
+            
         # Deduplication key: first 50 chars of message
         dedup_key = message[:50]
         if dedup_key in self._recent_alerts:

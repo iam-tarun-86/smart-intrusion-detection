@@ -31,6 +31,32 @@ from detection.zones import ZoneManager, Zone
 from stream_manager import StreamManager, CameraConfig, setup_test_cameras
 from zone_config import ZoneConfigManager
 from telegram_notifier import TelegramNotifier
+import os
+
+def load_env(dotenv_path: str = ".env"):
+    """Load variables from .env file into os.environ if it exists."""
+    paths = [
+        Path(dotenv_path),
+        Path(__file__).parent / dotenv_path,
+        Path(__file__).parent.parent / dotenv_path
+    ]
+    for path in paths:
+        if path.exists() and path.is_file():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip()
+                        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                            val = val[1:-1]
+                        os.environ.setdefault(key, val)
+            break
+
+load_env()
 
 
 # Create tables
@@ -105,9 +131,11 @@ def init_system():
     print("[System] Multi-stream detection initialized")
 
     global telegram
-    # Replace with your actual bot token and chat ID
+    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not telegram_bot_token:
+        print("[System] WARNING: TELEGRAM_BOT_TOKEN is not set in environment variables")
     telegram = TelegramNotifier(
-        bot_token="8525377163:AAEqzu8HulYOwzPEvqwhJTp9Y1Wu4kZYAnM",
+        bot_token=telegram_bot_token,
         chat_id="5037779190"
     )
     print("[System] Telegram notifier initialized")
