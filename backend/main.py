@@ -6,6 +6,7 @@ import cv2
 import json
 import asyncio
 import numpy as np
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict
@@ -136,7 +137,7 @@ def init_system():
         print("[System] WARNING: TELEGRAM_BOT_TOKEN is not set in environment variables")
     telegram = TelegramNotifier(
         bot_token=telegram_bot_token,
-        chat_id="5037779190"
+        chat_id=os.environ.get("TELEGRAM_CHAT_ID", "5037779190")
     )
     print("[System] Telegram notifier initialized")
 
@@ -269,6 +270,16 @@ CAMERA_UNIFORM_RULES = {
 }
 
 
+def is_live_source(source: str) -> bool:
+    """Check if the camera source is a live feed (RTSP, webcam, etc.) or a file."""
+    source_str = str(source).strip()
+    if source_str.isdigit():
+        return True
+    if source_str.lower().startswith(("rtsp://", "rtmp://", "http://", "https://", "udp://")):
+        return True
+    return False
+
+
 def generate_frames(camera_id: str = "cam1"):
     """Generator for MJPEG stream. Plays once, then holds last frame."""
     cap = stream_manager.get_capture(camera_id)
@@ -317,10 +328,18 @@ def generate_frames(camera_id: str = "cam1"):
     width, height = 768, 432
 
     video_ended = False
+    connection_lost = False
+    reconnect_attempts = 0
+    
+    camera_config = stream_manager.cameras.get(camera_id)
+    source = camera_config.source if camera_config else "0"
+    is_live = is_live_source(source)
+
     last_frame = None
     frame_count = 0
+    is_night_mode = False
 
-    print(f"[Stream] Starting stream for {camera_id}")
+    print(f"[Stream] Starting stream for {camera_id} (Live: {is_live})")
 
     while True:
         # Reload zones every 30 seconds to pick up changes
@@ -341,104 +360,149 @@ def generate_frames(camera_id: str = "cam1"):
 
         frame_count += 1
 
-        if not video_ended:
+        if connection_lost:
+            # Create a black frame with reconnect status
+            last_annotated_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            cv2.putText(
+                last_annotated_frame,
+                f"CAMERA DISCONNECTED - RETRYING (Attempt {reconnect_attempts})...",
+                (50, 216),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 165, 255),
+                2,
+            )
+            # Encode and yield
+            _, buffer = cv2.imencode(".jpg", last_annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            
+            # Try to reconnect
+            time.sleep(3.0)
+            reconnect_attempts += 1
+            cap.release()
+            cap = stream_manager.get_capture(camera_id)
+            if cap and cap.isOpened():
+                print(f"[Stream] Camera {camera_id} successfully reconnected!")
+                connection_lost = False
+                reconnect_attempts = 0
+            continue
+
+        if not video_ended and not connection_lost:
             ret, frame = cap.read()
             if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                # Reset alerts when video loops so we can demo again
-                if camera_id in zone_managers:
-                    zone_managers[camera_id].reset_alerts()
-                continue
+                if is_live:
+                    connection_lost = True
+                    print(f"[Stream] Connection lost for camera {camera_id}. Retrying...")
+                    continue
+                else:
+                    video_ended = True
+                    print(f"[Stream] Video ended for {camera_id}. Holding last frame and stopping detection.")
             else:
                 last_frame = frame.copy()
 
-        # Use last good frame if video ended
-        frame = (
-            last_frame.copy()
-            if last_frame is not None
-            else np.zeros((height, width, 3), dtype=np.uint8)
-        )
+        if not video_ended and not connection_lost and last_frame is not None:
+            frame_resized = cv2.resize(last_frame, (width, height))
 
-        frame = cv2.resize(frame, (width, height))
+            # Detect Night Mode (Thermal/IR)
+            is_night_mode = ZoneManager.check_is_night_mode(frame_resized)
 
-        # Run detection
-        annotated, detections = detector.detect(frame.copy())
+            # Run detection
+            annotated, detections = detector.detect(frame_resized.copy())
 
-        # Check intrusions using camera-specific zone manager
-        annotated, events = cam_zone_manager.check_intrusion(annotated, detections)
+            # Check intrusions using camera-specific zone manager (pass is_night_mode)
+            annotated, events = cam_zone_manager.check_intrusion(annotated, detections, is_night_mode=is_night_mode)
 
-        # Queue events for async processing
-        for event in events:
-            # Ensure track_id and duration_seconds exist on the event dict
-            event["track_id"] = event.get("track_id", 0)
-            event["duration_seconds"] = event.get("duration_seconds", 0)
-            
-            snapshot_dir = Path("snapshots") / camera_id
-            snapshot_dir.mkdir(parents=True, exist_ok=True)
-            snapshot_path = (
-                snapshot_dir
-                / f"event_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-            )
-            def save_snapshot(path, frame_to_save):
-                cv2.imwrite(str(path), frame_to_save, [cv2.IMWRITE_JPEG_QUALITY, 60])
-
-            Thread(target=save_snapshot, args=(snapshot_path, annotated.copy()), daemon=True).start()
-            event["snapshot"] = str(snapshot_path)
-            event["camera_id"] = camera_id
-            
-            if telegram and not event.get("authorized", True):
-                alert_msg = (
-                    f"🚨 <b>UNAUTHORIZED ACCESS</b>\n\n"
-                    f"Zone: {event['zone_name']}\n"
-                    f"Camera: {camera_id.upper()}\n"
-                    f"Shirt Color: {event.get('shirt_color', 'unknown').upper()}\n"
-                    f"Person ID: #{event.get('track_id', '?')}\n"
-                    f"Confidence: {event['confidence']*100:.1f}%\n"
-                    f"Time: {event['timestamp']}"
+            # Queue events for async processing
+            for event in events:
+                # Ensure track_id and duration_seconds exist on the event dict
+                event["track_id"] = event.get("track_id", 0)
+                event["duration_seconds"] = event.get("duration_seconds", 0)
+                
+                snapshot_dir = Path("snapshots") / camera_id
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
+                snapshot_path = (
+                    snapshot_dir
+                    / f"event_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
                 )
-                telegram.send_alert(alert_msg, str(snapshot_path))
 
-            alert_queue.put(event)
+                # Save the frame associated with this event synchronously to avoid the race condition with Telegram sending
+                frame_to_save = event.pop("custom_frame", annotated)
+                cv2.imwrite(str(snapshot_path), frame_to_save, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                
+                event["snapshot"] = str(snapshot_path)
+                event["camera_id"] = camera_id
+                
+                if telegram and not event.get("authorized", True):
+                    alert_msg = (
+                        f"🚨 <b>UNAUTHORIZED ACCESS</b>\n\n"
+                        f"Zone: {event['zone_name']}\n"
+                        f"Camera: {camera_id.upper()}\n"
+                        f"Shirt Color: {event.get('shirt_color', 'unknown').upper()}\n"
+                        f"Person ID: #{event.get('track_id', '?')}\n"
+                        f"Confidence: {event['confidence']*100:.1f}%\n"
+                        f"Time: {event['timestamp']}"
+                    )
+                    dedup_key = f"{camera_id}_{event['zone_name']}_{event.get('track_id', '?')}"
+                    telegram.send_alert(alert_msg, str(snapshot_path), dedup_key=dedup_key)
 
-            # Save to DB
-            db = None
-            try:
-                db = next(get_db())
-                db_event = IntrusionEvent(
-                    zone_name=event["zone_name"],
-                    camera_id=camera_id,
-                    confidence=event["confidence"],
-                    severity=event["severity"],
-                    snapshot_path=str(snapshot_path),
-                    risk_score=event.get("risk_score", 0),  # NEW
-                    duration_seconds=event.get("duration_seconds", 0.0),  # NEW
-                    bbox_x1=event["bbox"][0],
-                    bbox_y1=event["bbox"][1],
-                    bbox_x2=event["bbox"][2],
-                    bbox_y2=event["bbox"][3],
-                )
-                db.add(db_event)
-                db.commit()
-                db.refresh(db_event)
-                event["id"] = db_event.id
-            except Exception as e:
-                print(f"[DB Error] {e}")
-            finally:
-                if db:
-                    db.close()
+                alert_queue.put(event)
 
-        latest_frames[camera_id] = annotated
-        latest_detections[camera_id] = detections
+                # Save to DB
+                db = None
+                try:
+                    db = next(get_db())
+                    db_event = IntrusionEvent(
+                        zone_name=event["zone_name"],
+                        camera_id=camera_id,
+                        confidence=event["confidence"],
+                        severity=event["severity"],
+                        snapshot_path=str(snapshot_path),
+                        risk_score=event.get("risk_score", 0),
+                        duration_seconds=event.get("duration_seconds", 0.0),
+                        bbox_x1=event["bbox"][0],
+                        bbox_y1=event["bbox"][1],
+                        bbox_x2=event["bbox"][2],
+                        bbox_y2=event["bbox"][3],
+                    )
+                    db.add(db_event)
+                    db.commit()
+                    db.refresh(db_event)
+                    event["id"] = db_event.id
+                except Exception as e:
+                    print(f"[DB Error] {e}")
+                finally:
+                    if db:
+                        db.close()
 
-        # Overlay info
-        person_count = len(detections)
-        info = f"Cam: {camera_id} | Persons: {person_count} | Zones: {len(zones)}"
-        cv2.putText(annotated, info, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            latest_frames[camera_id] = annotated
+            latest_detections[camera_id] = detections
+            last_annotated_frame = annotated.copy()
+        else:
+            if last_frame is None:
+                last_annotated_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            else:
+                last_annotated_frame = latest_frames.get(camera_id, None)
+                if last_annotated_frame is None:
+                    last_annotated_frame = cv2.resize(last_frame, (width, height))
+                else:
+                    last_annotated_frame = last_annotated_frame.copy()
+
+        # Overlay info on frame if video is still active
+        if not video_ended and not connection_lost and last_frame is not None:
+            person_count = len(detections)
+            info = f"Cam: {camera_id} | Persons: {person_count} | Zones: {len(zones)}"
+            cv2.putText(last_annotated_frame, info, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if is_night_mode:
+                cv2.putText(last_annotated_frame, "MODE: NIGHT PROTOCOL (IR/GRAYSCALE)", (10, 70), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
         # Add "VIDEO ENDED" overlay if done
         if video_ended:
             cv2.putText(
-                annotated,
+                last_annotated_frame,
                 "STREAM ENDED - NO ACTIVE FEED",
                 (180, 216),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -448,7 +512,7 @@ def generate_frames(camera_id: str = "cam1"):
             )
 
         # Encode to JPEG
-        _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        _, buffer = cv2.imencode(".jpg", last_annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         frame_bytes = buffer.tobytes()
 
         yield (
